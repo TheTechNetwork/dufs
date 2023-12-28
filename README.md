@@ -72,6 +72,7 @@ Options:
       --render-spa           Serve SPA(Single Page Application)
       --assets <path>        Set the path to the assets directory for overriding the built-in assets
       --log-format <format>  Customize http log format
+      --compress <level>     Set zip compress level [default: low] [possible values: none, low, medium, high]
       --completions <shell>  Print shell completion script for <shell> [possible values: bash, elvish, fish, powershell, zsh]
       --tls-cert <path>      Path to an SSL/TLS certificate to serve with HTTPS
       --tls-key <path>       Path to the SSL/TLS certificate's private key
@@ -206,20 +207,21 @@ curl http://192.168.8.10:5000/file --user user:pass --digest        # digest aut
 Dufs supports account based access control. You can control who can do what on which path with `--auth`/`-a`.
 
 ```
-dufs -a user:pass@/path1:rw,/path2 -a user2:pass2@/path3 -a @/path4
+dufs -a admin:admin@/:rw -a guest:guest@/
+dufs -a user:pass@/:rw,/dir1,/dir2:- -a @/
 ```
 
 1. Use `@` to separate the account and paths. No account means anonymous user.
 2. Use `:` to separate the username and password of the account.
 3. Use `,` to separate paths.
-4. Use `:rw` suffix to indicate that the account has read-write permission on the path.
+4. Use path suffix `:rw`, `:ro`, `:-` to set permissions: `read-write`, `read-only`, `forbidden`. `:ro` can be omitted.
 
-- `-a admin:amdin@/:rw`: `admin` has complete permissions for all paths.
+- `-a admin:admin@/:rw`: `admin` has complete permissions for all paths.
 - `-a guest:guest@/`: `guest` has read-only permissions for all paths.
-- `-a user:pass@/dir1:rw,/dir2`: `user` has complete permissions for `/dir1/*`, has read-only permissions for `/dir2/`.
+- `-a user:pass@/:rw,/dir1,/dir2:-`: `user` has read-write permissions for `/*`, has read-only permissions for `/dir1/*`, but is fordden for `/dir2/*`.
 - `-a @/`: All paths is publicly accessible, everyone can view/download it.
 
-> There are no restrictions on using ':' and '@' characters in a password, `user:pa:ss@1@/:rw` is valid, and the password is `pa:ss@1`.
+> There are no restrictions on using ':' and '@' characters in a password. For example, `user:pa:ss@1@/:rw` is valid, the password is `pa:ss@1`.
 
 #### Hashed Password
 
@@ -326,6 +328,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --render-spa            DUFS_RENDER_SPA=true
     --assets <path>         DUFS_ASSETS=/assets
     --log-format <format>   DUFS_LOG_FORMAT=""
+    --compress <compress>   DUFS_COMPRESS="low"
     --tls-cert <path>       DUFS_TLS_CERT=cert.pem
     --tls-key <path>        DUFS_TLS_KEY=key.pem
 ```
@@ -348,6 +351,7 @@ hidden:
 auth:
   - admin:admin@/:rw
   - user:pass@/src:rw,/share
+  - '@/'  # According to the YAML spec, quoting is required.
 allow-all: false
 allow-upload: true
 allow-delete: true
@@ -360,6 +364,7 @@ render-try-index: true
 render-spa: true
 assets: ./assets/
 log-format: '$remote_addr "$request" $status $http_user_agent'
+compress: low
 tls-cert: tests/data/cert.pem
 tls-key: tests/data/key_pkcs1.pem
 ```

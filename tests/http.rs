@@ -40,7 +40,12 @@ fn head_dir_404(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
-fn get_dir_zip(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+#[case(server(&["--allow-archive"] as &[&str]))]
+#[case(server(&["--allow-archive", "--compress", "none"]))]
+#[case(server(&["--allow-archive", "--compress", "low"]))]
+#[case(server(&["--allow-archive", "--compress", "medium"]))]
+#[case(server(&["--allow-archive", "--compress", "high"]))]
+fn get_dir_zip(#[case] server: TestServer) -> Result<(), Error> {
     let resp = reqwest::blocking::get(format!("{}?zip", server.url()))?;
     assert_eq!(resp.status(), 200);
     assert_eq!(
@@ -198,6 +203,18 @@ fn get_file_emoji_path(server: TestServer) -> Result<(), Error> {
     assert_eq!(
         resp.headers().get("content-disposition").unwrap(),
         "inline; filename=\"😀.bin\"; filename*=UTF-8''%F0%9F%98%80.bin"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[rstest]
+fn get_file_newline_path(server: TestServer) -> Result<(), Error> {
+    let resp = reqwest::blocking::get(format!("{}file%0A1.txt", server.url()))?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-disposition").unwrap(),
+        "inline; filename=\"file 1.txt\""
     );
     Ok(())
 }

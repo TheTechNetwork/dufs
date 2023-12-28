@@ -1,29 +1,33 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm};
-use crate::streamer::Streamer;
+use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::utils::{
-    decode_uri, encode_uri, get_file_mtime_and_mode, get_file_name, glob, try_get_file_name,
+    decode_uri, encode_uri, get_file_mtime_and_mode, get_file_name, glob, parse_range,
+    try_get_file_name,
 };
 use crate::Args;
-use anyhow::{anyhow, Result};
-use walkdir::WalkDir;
-use xml::escape::escape_str_pcdata;
 
-use async_zip::tokio::write::ZipFileWriter;
-use async_zip::{Compression, ZipDateTime, ZipEntryBuilder};
+use anyhow::{anyhow, Result};
+use async_zip::{tokio::write::ZipFileWriter, Compression, ZipDateTime, ZipEntryBuilder};
+use bytes::Bytes;
 use chrono::{LocalResult, TimeZone, Utc};
-use futures::TryStreamExt;
+use futures_util::{pin_mut, TryStreamExt};
 use headers::{
     AcceptRanges, AccessControlAllowCredentials, AccessControlAllowOrigin, CacheControl,
     ContentLength, ContentType, ETag, HeaderMap, HeaderMapExt, IfModifiedSince, IfNoneMatch,
     IfRange, LastModified, Range,
 };
-use hyper::header::{
-    HeaderValue, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-    RANGE,
+use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
+use hyper::body::Frame;
+use hyper::{
+    body::Incoming,
+    header::{
+        HeaderValue, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+        CONTENT_TYPE, RANGE,
+    },
+    Method, StatusCode, Uri,
 };
-use hyper::{Body, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -39,11 +43,13 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
 use tokio::{fs, io};
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
-use tokio_util::io::StreamReader;
+use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
+use walkdir::WalkDir;
+use xml::escape::escape_str_pcdata;
 
-pub type Request = hyper::Request<Body>;
-pub type Response = hyper::Response<Body>;
+pub type Request = hyper::Request<Incoming>;
+pub type Response = hyper::Response<BoxBody<Bytes, anyhow::Error>>;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const INDEX_CSS: &str = include_str!("../assets/index.css");
@@ -54,7 +60,7 @@ const BUF_SIZE: usize = 65536;
 const TEXT_MAX_SIZE: u64 = 4194304; // 4M
 
 pub struct Server {
-    args: Arc<Args>,
+    args: Args,
     assets_prefix: String,
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
@@ -62,7 +68,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn init(args: Arc<Args>, running: Arc<AtomicBool>) -> Result<Self> {
+    pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
         let assets_prefix = format!("{}__dufs_v{}_", args.uri_prefix, env!("CARGO_PKG_VERSION"));
         let single_file_req_paths = if args.path_is_file {
             vec![
@@ -339,7 +345,7 @@ impl Server {
             method => match method.as_str() {
                 "PROPFIND" => {
                     if is_dir {
-                        let access_paths = if access_paths.perm().indexonly() {
+                        let access_paths = if access_paths.perm().inherit() {
                             // see https://github.com/sigoden/dufs/issues/229
                             AccessPaths::new(AccessPerm::ReadOnly)
                         } else {
@@ -365,7 +371,7 @@ impl Server {
                         status_forbid(&mut res);
                     } else if !is_miss {
                         *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                        *res.body_mut() = Body::from("Already exists");
+                        *res.body_mut() = body_full("Already exists");
                     } else {
                         self.handle_mkcol(path, &mut res).await?;
                     }
@@ -411,7 +417,7 @@ impl Server {
         Ok(res)
     }
 
-    async fn handle_upload(&self, path: &Path, mut req: Request, res: &mut Response) -> Result<()> {
+    async fn handle_upload(&self, path: &Path, req: Request, res: &mut Response) -> Result<()> {
         ensure_path_parent(path).await?;
 
         let mut file = match fs::File::create(&path).await {
@@ -422,13 +428,12 @@ impl Server {
             }
         };
 
-        let body_with_io_error = req
-            .body_mut()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+        let stream = IncomingStream::new(req.into_body());
 
+        let body_with_io_error = stream.map_err(|err| io::Error::new(io::ErrorKind::Other, err));
         let body_reader = StreamReader::new(body_with_io_error);
 
-        futures::pin_mut!(body_reader);
+        pin_mut!(body_reader);
 
         let ret = io::copy(&mut body_reader, &mut file).await;
         if ret.is_err() {
@@ -509,7 +514,7 @@ impl Server {
             let access_paths = access_paths.clone();
             let search_paths = tokio::task::spawn_blocking(move || {
                 let mut paths: Vec<PathBuf> = vec![];
-                for dir in access_paths.leaf_paths(&path_buf) {
+                for dir in access_paths.child_paths(&path_buf) {
                     let mut it = WalkDir::new(&dir).into_iter();
                     it.next();
                     while let Some(Ok(entry)) = it.next() {
@@ -581,13 +586,29 @@ impl Server {
         let path = path.to_owned();
         let hidden = self.args.hidden.clone();
         let running = self.running.clone();
+        let compression = self.args.compress.to_compression();
         tokio::spawn(async move {
-            if let Err(e) = zip_dir(&mut writer, &path, access_paths, &hidden, running).await {
+            if let Err(e) = zip_dir(
+                &mut writer,
+                &path,
+                access_paths,
+                &hidden,
+                compression,
+                running,
+            )
+            .await
+            {
                 error!("Failed to zip {}, {}", path.display(), e);
             }
         });
-        let reader = Streamer::new(reader, BUF_SIZE);
-        *res.body_mut() = Body::wrap_stream(reader.into_stream());
+        let reader_stream = ReaderStream::new(reader);
+        let stream_body = StreamBody::new(
+            reader_stream
+                .map_ok(Frame::data)
+                .map_err(|err| anyhow!("{err}")),
+        );
+        let boxed_body = stream_body.boxed();
+        *res.body_mut() = boxed_body;
         Ok(())
     }
 
@@ -650,21 +671,21 @@ impl Server {
                 }
                 None => match name {
                     "index.js" => {
-                        *res.body_mut() = Body::from(INDEX_JS);
+                        *res.body_mut() = body_full(INDEX_JS);
                         res.headers_mut().insert(
                             "content-type",
                             HeaderValue::from_static("application/javascript; charset=UTF-8"),
                         );
                     }
                     "index.css" => {
-                        *res.body_mut() = Body::from(INDEX_CSS);
+                        *res.body_mut() = body_full(INDEX_CSS);
                         res.headers_mut().insert(
                             "content-type",
                             HeaderValue::from_static("text/css; charset=UTF-8"),
                         );
                     }
                     "favicon.ico" => {
-                        *res.body_mut() = Body::from(FAVICON_ICO);
+                        *res.body_mut() = body_full(FAVICON_ICO);
                         res.headers_mut()
                             .insert("content-type", HeaderValue::from_static("image/x-icon"));
                     }
@@ -696,6 +717,7 @@ impl Server {
     ) -> Result<()> {
         let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
         let (mut file, meta) = (file?, meta?);
+        let size = meta.len();
         let mut use_range = true;
         if let Some((etag, last_modified)) = extract_cache_headers(&meta) {
             let cached = {
@@ -727,7 +749,12 @@ impl Server {
         }
 
         let range = if use_range {
-            parse_range(headers)
+            headers.get(RANGE).map(|range| {
+                range
+                    .to_str()
+                    .ok()
+                    .and_then(|range| parse_range(range, size))
+            })
         } else {
             None
         };
@@ -742,27 +769,27 @@ impl Server {
 
         res.headers_mut().typed_insert(AcceptRanges::bytes());
 
-        let size = meta.len();
-
         if let Some(range) = range {
-            if range
-                .end
-                .map_or_else(|| range.start < size, |v| v >= range.start)
-                && file.seek(SeekFrom::Start(range.start)).await.is_ok()
-            {
-                let end = range.end.unwrap_or(size - 1).min(size - 1);
-                let part_size = end - range.start + 1;
-                let reader = Streamer::new(file, BUF_SIZE);
+            if let Some((start, end)) = range {
+                file.seek(SeekFrom::Start(start)).await?;
+                let range_size = end - start + 1;
                 *res.status_mut() = StatusCode::PARTIAL_CONTENT;
-                let content_range = format!("bytes {}-{}/{}", range.start, end, size);
+                let content_range = format!("bytes {}-{}/{}", start, end, size);
                 res.headers_mut()
                     .insert(CONTENT_RANGE, content_range.parse()?);
                 res.headers_mut()
-                    .insert(CONTENT_LENGTH, format!("{part_size}").parse()?);
+                    .insert(CONTENT_LENGTH, format!("{range_size}").parse()?);
                 if head_only {
                     return Ok(());
                 }
-                *res.body_mut() = Body::wrap_stream(reader.into_stream_sized(part_size));
+
+                let stream_body = StreamBody::new(
+                    LengthLimitedStream::new(file, range_size as usize)
+                        .map_ok(Frame::data)
+                        .map_err(|err| anyhow!("{err}")),
+                );
+                let boxed_body = stream_body.boxed();
+                *res.body_mut() = boxed_body;
             } else {
                 *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
                 res.headers_mut()
@@ -774,8 +801,15 @@ impl Server {
             if head_only {
                 return Ok(());
             }
-            let reader = Streamer::new(file, BUF_SIZE);
-            *res.body_mut() = Body::wrap_stream(reader.into_stream());
+
+            let reader_stream = ReaderStream::new(file);
+            let stream_body = StreamBody::new(
+                reader_stream
+                    .map_ok(Frame::data)
+                    .map_err(|err| anyhow!("{err}")),
+            );
+            let boxed_body = stream_body.boxed();
+            *res.body_mut() = boxed_body;
         }
         Ok(())
     }
@@ -818,7 +852,7 @@ impl Server {
         if head_only {
             return Ok(());
         }
-        *res.body_mut() = output.into();
+        *res.body_mut() = body_full(output);
         Ok(())
     }
 
@@ -933,7 +967,7 @@ impl Server {
         res.headers_mut()
             .insert("lock-token", format!("<{token}>").parse()?);
 
-        *res.body_mut() = Body::from(format!(
+        *res.body_mut() = body_full(format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>
 <D:locktoken><D:href>{token}</D:href></D:locktoken>
@@ -1004,7 +1038,7 @@ impl Server {
                 .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
             res.headers_mut()
                 .typed_insert(ContentLength(output.as_bytes().len() as u64));
-            *res.body_mut() = output.into();
+            *res.body_mut() = body_full(output);
             if head_only {
                 return Ok(());
             }
@@ -1050,7 +1084,7 @@ impl Server {
         if head_only {
             return Ok(());
         }
-        *res.body_mut() = output.into();
+        *res.body_mut() = body_full(output);
         Ok(())
     }
 
@@ -1149,8 +1183,8 @@ impl Server {
         access_paths: AccessPaths,
     ) -> Result<Vec<PathItem>> {
         let mut paths: Vec<PathItem> = vec![];
-        if access_paths.perm().indexonly() {
-            for name in access_paths.child_paths() {
+        if access_paths.perm().inherit() {
+            for name in access_paths.child_names() {
                 let entry_path = entry_path.join(name);
                 self.add_pathitem(&mut paths, base_path, &entry_path).await;
             }
@@ -1409,7 +1443,7 @@ fn res_multistatus(res: &mut Response, content: &str) {
         "content-type",
         HeaderValue::from_static("application/xml; charset=utf-8"),
     );
-    *res.body_mut() = Body::from(format!(
+    *res.body_mut() = body_full(format!(
         r#"<?xml version="1.0" encoding="utf-8" ?>
 <D:multistatus xmlns:D="DAV:">
 {content}
@@ -1422,6 +1456,7 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     dir: &Path,
     access_paths: AccessPaths,
     hidden: &[String],
+    compression: Compression,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut writer = ZipFileWriter::with_tokio(writer);
@@ -1430,7 +1465,7 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     let dir_clone = dir.to_path_buf();
     let zip_paths = tokio::task::spawn_blocking(move || {
         let mut paths: Vec<PathBuf> = vec![];
-        for dir in access_paths.leaf_paths(&dir_clone) {
+        for dir in access_paths.child_paths(&dir_clone) {
             let mut it = WalkDir::new(&dir).into_iter();
             it.next();
             while let Some(Ok(entry)) = it.next() {
@@ -1475,7 +1510,7 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
             None => continue,
         };
         let (datetime, mode) = get_file_mtime_and_mode(&zip_path).await?;
-        let builder = ZipEntryBuilder::new(filename.into(), Compression::Deflate)
+        let builder = ZipEntryBuilder::new(filename.into(), compression)
             .unix_permissions(mode)
             .last_modification_date(ZipDateTime::from_chrono(&datetime));
         let mut file = File::open(&zip_path).await?;
@@ -1496,44 +1531,14 @@ fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
     Some((etag, last_modified))
 }
 
-#[derive(Debug)]
-struct RangeValue {
-    start: u64,
-    end: Option<u64>,
-}
-
-fn parse_range(headers: &HeaderMap<HeaderValue>) -> Option<RangeValue> {
-    let range_hdr = headers.get(RANGE)?;
-    let hdr = range_hdr.to_str().ok()?;
-    let mut sp = hdr.splitn(2, '=');
-    let units = sp.next()?;
-    if units == "bytes" {
-        let range = sp.next()?;
-        let mut sp_range = range.splitn(2, '-');
-        let start: u64 = sp_range.next()?.parse().ok()?;
-        let end: Option<u64> = if let Some(end) = sp_range.next() {
-            if end.is_empty() {
-                None
-            } else {
-                Some(end.parse().ok()?)
-            }
-        } else {
-            None
-        };
-        Some(RangeValue { start, end })
-    } else {
-        None
-    }
-}
-
 fn status_forbid(res: &mut Response) {
     *res.status_mut() = StatusCode::FORBIDDEN;
-    *res.body_mut() = Body::from("Forbidden");
+    *res.body_mut() = body_full("Forbidden");
 }
 
 fn status_not_found(res: &mut Response) {
     *res.status_mut() = StatusCode::NOT_FOUND;
-    *res.body_mut() = Body::from("Not Found");
+    *res.body_mut() = body_full("Not Found");
 }
 
 fn status_no_content(res: &mut Response) {
@@ -1542,13 +1547,23 @@ fn status_no_content(res: &mut Response) {
 
 fn set_content_diposition(res: &mut Response, inline: bool, filename: &str) -> Result<()> {
     let kind = if inline { "inline" } else { "attachment" };
+    let filename: String = filename
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_control() && ch != '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
     let value = if filename.is_ascii() {
         HeaderValue::from_str(&format!("{kind}; filename=\"{}\"", filename,))?
     } else {
         HeaderValue::from_str(&format!(
             "{kind}; filename=\"{}\"; filename*=UTF-8''{}",
             filename,
-            encode_uri(filename),
+            encode_uri(&filename),
         ))?
     };
     res.headers_mut().insert(CONTENT_DISPOSITION, value);

@@ -145,6 +145,23 @@ fn auth_readonly(
 }
 
 #[rstest]
+fn auth_forbidden(
+    #[with(&["--auth", "user:pass@/:rw,/dir1:-", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let url = format!("{}file1", server.url());
+    let resp = fetch!(b"PUT", &url)
+        .body(b"abc".to_vec())
+        .send_with_digest_auth("user", "pass")?;
+    assert_eq!(resp.status(), 201);
+    let url = format!("{}dir1/file1", server.url());
+    let resp = fetch!(b"PUT", &url)
+        .body(b"abc".to_vec())
+        .send_with_digest_auth("user", "pass")?;
+    assert_eq!(resp.status(), 403);
+    Ok(())
+}
+
+#[rstest]
 fn auth_nest(
     #[with(&["--auth", "user:pass@/:rw", "--auth", "user2:pass2@/", "--auth", "user3:pass3@/dir1:rw", "-A"])]
     server: TestServer,
@@ -280,5 +297,24 @@ fn auth_data(
     let json = utils::retrive_json(&content).unwrap();
     assert_eq!(json["allow_delete"], serde_json::Value::Bool(true));
     assert_eq!(json["allow_upload"], serde_json::Value::Bool(true));
+    Ok(())
+}
+
+#[rstest]
+fn auth_precedence(
+    #[with(&["--auth", "user:pass@/dir1:rw,/dir1/test.txt", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let url = format!("{}dir1/test.txt", server.url());
+    let resp = fetch!(b"PUT", &url)
+        .body(b"abc".to_vec())
+        .send_with_digest_auth("user", "pass")?;
+    assert_eq!(resp.status(), 403);
+
+    let url = format!("{}dir1/file1", server.url());
+    let resp = fetch!(b"PUT", &url)
+        .body(b"abc".to_vec())
+        .send_with_digest_auth("user", "pass")?;
+    assert_eq!(resp.status(), 201);
+
     Ok(())
 }
