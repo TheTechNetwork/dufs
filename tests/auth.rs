@@ -39,6 +39,25 @@ fn auth(#[case] server: TestServer, #[case] user: &str, #[case] pass: &str) -> R
     Ok(())
 }
 
+#[rstest]
+fn invalid_auth(
+    #[with(&["-a", "user:pass@/:rw", "-a", "@/", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = fetch!(b"GET", server.url())
+        .basic_auth("user", Some("-"))
+        .send()?;
+    assert_eq!(resp.status(), 401);
+    let resp = fetch!(b"GET", server.url())
+        .basic_auth("-", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 401);
+    let resp = fetch!(b"GET", server.url())
+        .header("Authorization", "Basic Og==")
+        .send()?;
+    assert_eq!(resp.status(), 401);
+    Ok(())
+}
+
 const HASHED_PASSWORD_AUTH: &str =  "user:$6$gQxZwKyWn/ZmWEA2$4uV7KKMnSUnET2BtWTj/9T5.Jq3h/MdkOlnIl5hdlTxDZ4MZKmJ.kl6C.NL9xnNPqC4lVHC1vuI0E5cLpTJX81@/:rw"; // user:pass
 
 #[rstest]
@@ -140,23 +159,6 @@ fn auth_readonly(
     let resp = fetch!(b"PUT", &url)
         .body(b"abc".to_vec())
         .send_with_digest_auth("user2", "pass2")?;
-    assert_eq!(resp.status(), 403);
-    Ok(())
-}
-
-#[rstest]
-fn auth_forbidden(
-    #[with(&["--auth", "user:pass@/:rw,/dir1:-", "-A"])] server: TestServer,
-) -> Result<(), Error> {
-    let url = format!("{}file1", server.url());
-    let resp = fetch!(b"PUT", &url)
-        .body(b"abc".to_vec())
-        .send_with_digest_auth("user", "pass")?;
-    assert_eq!(resp.status(), 201);
-    let url = format!("{}dir1/file1", server.url());
-    let resp = fetch!(b"PUT", &url)
-        .body(b"abc".to_vec())
-        .send_with_digest_auth("user", "pass")?;
     assert_eq!(resp.status(), 403);
     Ok(())
 }
@@ -271,13 +273,26 @@ fn auth_partial_index(
 
 #[rstest]
 fn no_auth_propfind_dir(
-    #[with(&["--auth", "user:pass@/:rw", "--auth", "@/dir-assets", "-A"])] server: TestServer,
+    #[with(&["--auth", "admin:admin@/:rw", "--auth", "@/dir-assets", "-A"])] server: TestServer,
 ) -> Result<(), Error> {
     let resp = fetch!(b"PROPFIND", server.url()).send()?;
     assert_eq!(resp.status(), 207);
     let body = resp.text()?;
     assert!(body.contains("<D:href>/dir-assets/</D:href>"));
     assert!(body.contains("<D:href>/dir1/</D:href>"));
+    Ok(())
+}
+
+#[rstest]
+fn auth_propfind_dir(
+    #[with(&["--auth", "admin:admin@/:rw", "--auth", "user:pass@/dir-assets", "-A"])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let resp = fetch!(b"PROPFIND", server.url()).send_with_digest_auth("user", "pass")?;
+    assert_eq!(resp.status(), 207);
+    let body = resp.text()?;
+    assert!(body.contains("<D:href>/dir-assets/</D:href>"));
+    assert!(!body.contains("<D:href>/dir1/</D:href>"));
     Ok(())
 }
 

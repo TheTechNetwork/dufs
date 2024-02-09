@@ -35,13 +35,14 @@ use std::collections::HashMap;
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
 use tokio::{fs, io};
+
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
@@ -57,7 +58,8 @@ const INDEX_JS: &str = include_str!("../assets/index.js");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
 const INDEX_NAME: &str = "index.html";
 const BUF_SIZE: usize = 65536;
-const TEXT_MAX_SIZE: u64 = 4194304; // 4M
+const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
+const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 
 pub struct Server {
     args: Args,
@@ -69,7 +71,7 @@ pub struct Server {
 
 impl Server {
     pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
-        let assets_prefix = format!("{}__dufs_v{}_", args.uri_prefix, env!("CARGO_PKG_VERSION"));
+        let assets_prefix = format!("__dufs_v{}__/", env!("CARGO_PKG_VERSION"));
         let single_file_req_paths = if args.path_is_file {
             vec![
                 args.uri_prefix.to_string(),
@@ -142,19 +144,23 @@ impl Server {
         let headers = req.headers();
         let method = req.method().clone();
 
-        if method == Method::GET && self.handle_assets(req_path, headers, &mut res).await? {
-            return Ok(res);
-        }
-
-        let authorization = headers.get(AUTHORIZATION);
         let relative_path = match self.resolve_path(req_path) {
             Some(v) => v,
             None => {
-                status_forbid(&mut res);
+                status_bad_request(&mut res, "Invalid Path");
                 return Ok(res);
             }
         };
 
+        if method == Method::GET
+            && self
+                .handle_assets(&relative_path, headers, &mut res)
+                .await?
+        {
+            return Ok(res);
+        }
+
+        let authorization = headers.get(AUTHORIZATION);
         let guard = self.args.auth.guard(&relative_path, &method, authorization);
 
         let (user, access_paths) = match guard {
@@ -296,10 +302,10 @@ impl Server {
                     }
                 } else if is_file {
                     if query_params.contains_key("edit") {
-                        self.handle_deal_file(path, DataKind::Edit, head_only, user, &mut res)
+                        self.handle_edit_file(path, DataKind::Edit, head_only, user, &mut res)
                             .await?;
                     } else if query_params.contains_key("view") {
-                        self.handle_deal_file(path, DataKind::View, head_only, user, &mut res)
+                        self.handle_edit_file(path, DataKind::View, head_only, user, &mut res)
                             .await?;
                     } else {
                         self.handle_send_file(path, headers, head_only, &mut res)
@@ -327,10 +333,37 @@ impl Server {
                 set_webdav_headers(&mut res);
             }
             Method::PUT => {
-                if !allow_upload || (!allow_delete && is_file && size > 0) {
+                if is_dir || !allow_upload || (!allow_delete && size > 0) {
                     status_forbid(&mut res);
                 } else {
-                    self.handle_upload(path, req, &mut res).await?;
+                    self.handle_upload(path, None, size, req, &mut res).await?;
+                }
+            }
+            Method::PATCH => {
+                if is_miss {
+                    status_not_found(&mut res);
+                } else if !allow_upload {
+                    status_forbid(&mut res);
+                } else {
+                    let offset = match parse_upload_offset(headers, size) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            status_bad_request(&mut res, &err.to_string());
+                            return Ok(res);
+                        }
+                    };
+                    match offset {
+                        Some(offset) => {
+                            if offset < size && !allow_delete {
+                                status_forbid(&mut res);
+                            }
+                            self.handle_upload(path, Some(offset), size, req, &mut res)
+                                .await?;
+                        }
+                        None => {
+                            *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+                        }
+                    }
                 }
             }
             Method::DELETE => {
@@ -345,12 +378,13 @@ impl Server {
             method => match method.as_str() {
                 "PROPFIND" => {
                     if is_dir {
-                        let access_paths = if access_paths.perm().inherit() {
-                            // see https://github.com/sigoden/dufs/issues/229
-                            AccessPaths::new(AccessPerm::ReadOnly)
-                        } else {
-                            access_paths
-                        };
+                        let access_paths =
+                            if access_paths.perm().indexonly() && authorization.is_none() {
+                                // see https://github.com/sigoden/dufs/issues/229
+                                AccessPaths::new(AccessPerm::ReadOnly)
+                            } else {
+                                access_paths
+                            };
                         self.handle_propfind_dir(path, headers, access_paths, &mut res)
                             .await?;
                     } else if is_file {
@@ -417,17 +451,27 @@ impl Server {
         Ok(res)
     }
 
-    async fn handle_upload(&self, path: &Path, req: Request, res: &mut Response) -> Result<()> {
+    async fn handle_upload(
+        &self,
+        path: &Path,
+        upload_offset: Option<u64>,
+        size: u64,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
         ensure_path_parent(path).await?;
-
-        let mut file = match fs::File::create(&path).await {
-            Ok(v) => v,
-            Err(_) => {
-                status_forbid(res);
-                return Ok(());
+        let (mut file, status) = match upload_offset {
+            None => (fs::File::create(path).await?, StatusCode::CREATED),
+            Some(offset) if offset == size => (
+                fs::OpenOptions::new().append(true).open(path).await?,
+                StatusCode::NO_CONTENT,
+            ),
+            Some(offset) => {
+                let mut file = fs::OpenOptions::new().write(true).open(path).await?;
+                file.seek(SeekFrom::Start(offset)).await?;
+                (file, StatusCode::NO_CONTENT)
             }
         };
-
         let stream = IncomingStream::new(req.into_body());
 
         let body_with_io_error = stream.map_err(|err| io::Error::new(io::ErrorKind::Other, err));
@@ -436,13 +480,19 @@ impl Server {
         pin_mut!(body_reader);
 
         let ret = io::copy(&mut body_reader, &mut file).await;
+        let size = fs::metadata(path)
+            .await
+            .map(|v| v.len())
+            .unwrap_or_default();
         if ret.is_err() {
-            tokio::fs::remove_file(&path).await?;
-
+            if upload_offset.is_none() && size < RESUMABLE_UPLOAD_MIN_SIZE {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
             ret?;
         }
 
-        *res.status_mut() = StatusCode::CREATED;
+        *res.status_mut() = status;
+
         Ok(())
     }
 
@@ -577,7 +627,7 @@ impl Server {
     ) -> Result<()> {
         let (mut writer, reader) = tokio::io::duplex(BUF_SIZE);
         let filename = try_get_file_name(path)?;
-        set_content_diposition(res, false, &format!("{}.zip", filename))?;
+        set_content_disposition(res, false, &format!("{}.zip", filename))?;
         res.headers_mut()
             .insert("content-type", HeaderValue::from_static("application/zip"));
         if head_only {
@@ -667,7 +717,12 @@ impl Server {
             match self.args.assets.as_ref() {
                 Some(assets_path) => {
                     let path = assets_path.join(name);
-                    self.handle_send_file(&path, headers, false, res).await?;
+                    if path.exists() {
+                        self.handle_send_file(&path, headers, false, res).await?;
+                    } else {
+                        status_not_found(res);
+                        return Ok(true);
+                    }
                 }
                 None => match name {
                     "index.js" => {
@@ -765,7 +820,7 @@ impl Server {
         );
 
         let filename = try_get_file_name(path)?;
-        set_content_diposition(res, true, filename)?;
+        set_content_disposition(res, true, filename)?;
 
         res.headers_mut().typed_insert(AcceptRanges::bytes());
 
@@ -814,7 +869,7 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_deal_file(
+    async fn handle_edit_file(
         &self,
         path: &Path,
         kind: DataKind,
@@ -830,7 +885,8 @@ impl Server {
         );
         let mut buffer: Vec<u8> = vec![];
         file.take(1024).read_to_end(&mut buffer).await?;
-        let editable = meta.len() <= TEXT_MAX_SIZE && content_inspector::inspect(&buffer).is_text();
+        let editable =
+            meta.len() <= EDITABLE_TEXT_MAX_SIZE && content_inspector::inspect(&buffer).is_text();
         let data = EditData {
             href,
             kind,
@@ -845,7 +901,10 @@ impl Server {
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
         let output = self
             .html
-            .replace("__ASSETS_PREFIX__", &self.assets_prefix)
+            .replace(
+                "__ASSETS_PREFIX__",
+                &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
+            )
             .replace("__INDEX_DATA__", &serde_json::to_string(&data)?);
         res.headers_mut()
             .typed_insert(ContentLength(output.as_bytes().len() as u64));
@@ -867,7 +926,7 @@ impl Server {
             Some(v) => match v.to_str().ok().and_then(|v| v.parse().ok()) {
                 Some(v) => v,
                 None => {
-                    *res.status_mut() = StatusCode::BAD_REQUEST;
+                    status_bad_request(res, "");
                     return Ok(());
                 }
             },
@@ -1070,7 +1129,10 @@ impl Server {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
             self.html
-                .replace("__ASSETS_PREFIX__", &self.assets_prefix)
+                .replace(
+                    "__ASSETS_PREFIX__",
+                    &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
+                )
                 .replace("__INDEX_DATA__", &serde_json::to_string(&data)?)
         };
         res.headers_mut()
@@ -1106,18 +1168,13 @@ impl Server {
 
     fn extract_dest(&self, req: &Request, res: &mut Response) -> Option<PathBuf> {
         let headers = req.headers();
-        let dest_path = match self.extract_destination_header(headers) {
+        let dest_path = match self
+            .extract_destination_header(headers)
+            .and_then(|dest| self.resolve_path(&dest))
+        {
             Some(dest) => dest,
             None => {
-                *res.status_mut() = StatusCode::BAD_REQUEST;
-                return None;
-            }
-        };
-
-        let relative_path = match self.resolve_path(&dest_path) {
-            Some(v) => v,
-            None => {
-                *res.status_mut() = StatusCode::BAD_REQUEST;
+                status_bad_request(res, "Invalid Destination");
                 return None;
             }
         };
@@ -1126,7 +1183,7 @@ impl Server {
         let guard = self
             .args
             .auth
-            .guard(&relative_path, req.method(), authorization);
+            .guard(&dest_path, req.method(), authorization);
 
         match guard {
             (_, Some(_)) => {}
@@ -1136,7 +1193,7 @@ impl Server {
             }
         };
 
-        let dest = match self.join_path(&relative_path) {
+        let dest = match self.join_path(&dest_path) {
             Some(dest) => dest,
             None => {
                 *res.status_mut() = StatusCode::BAD_REQUEST;
@@ -1154,13 +1211,30 @@ impl Server {
     }
 
     fn resolve_path(&self, path: &str) -> Option<String> {
-        let path = path.trim_matches('/');
         let path = decode_uri(path)?;
-        let prefix = self.args.path_prefix.as_str();
-        if prefix == "/" {
-            return Some(path.to_string());
+        let path = path.trim_matches('/');
+        let mut parts = vec![];
+        for comp in Path::new(path).components() {
+            if let Component::Normal(v) = comp {
+                let v = v.to_string_lossy();
+                if cfg!(windows) {
+                    let chars: Vec<char> = v.chars().collect();
+                    if chars.len() == 2 && chars[1] == ':' && chars[0].is_ascii_alphabetic() {
+                        return None;
+                    }
+                }
+                parts.push(v);
+            } else {
+                return None;
+            }
         }
-        path.strip_prefix(prefix.trim_start_matches('/'))
+        let new_path = parts.join("/");
+        let path_prefix = self.args.path_prefix.as_str();
+        if path_prefix.is_empty() {
+            return Some(new_path);
+        }
+        new_path
+            .strip_prefix(path_prefix.trim_start_matches('/'))
             .map(|v| v.trim_matches('/').to_string())
     }
 
@@ -1183,7 +1257,7 @@ impl Server {
         access_paths: AccessPaths,
     ) -> Result<Vec<PathItem>> {
         let mut paths: Vec<PathItem> = vec![];
-        if access_paths.perm().inherit() {
+        if access_paths.perm().indexonly() {
             for name in access_paths.child_names() {
                 let entry_path = entry_path.join(name);
                 self.add_pathitem(&mut paths, base_path, &entry_path).await;
@@ -1545,7 +1619,14 @@ fn status_no_content(res: &mut Response) {
     *res.status_mut() = StatusCode::NO_CONTENT;
 }
 
-fn set_content_diposition(res: &mut Response, inline: bool, filename: &str) -> Result<()> {
+fn status_bad_request(res: &mut Response, body: &str) {
+    *res.status_mut() = StatusCode::BAD_REQUEST;
+    if !body.is_empty() {
+        *res.body_mut() = body_full(body.to_string());
+    }
+}
+
+fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> Result<()> {
     let kind = if inline { "inline" } else { "attachment" };
     let filename: String = filename
         .chars()
@@ -1584,10 +1665,12 @@ fn is_hidden(hidden: &[String], file_name: &str, is_dir_type: bool) -> bool {
 fn set_webdav_headers(res: &mut Response) {
     res.headers_mut().insert(
         "Allow",
-        HeaderValue::from_static("GET,HEAD,PUT,OPTIONS,DELETE,PROPFIND,COPY,MOVE"),
+        HeaderValue::from_static("GET,HEAD,PUT,OPTIONS,DELETE,PATCH,PROPFIND,COPY,MOVE"),
     );
-    res.headers_mut()
-        .insert("DAV", HeaderValue::from_static("1,2"));
+    res.headers_mut().insert(
+        "DAV",
+        HeaderValue::from_static("1, 2, 3, sabredav-partialupdate"),
+    );
 }
 
 async fn get_content_type(path: &Path) -> Result<String> {
@@ -1619,4 +1702,18 @@ async fn get_content_type(path: &Path) -> Result<String> {
         }
     };
     Ok(content_type)
+}
+
+fn parse_upload_offset(headers: &HeaderMap<HeaderValue>, size: u64) -> Result<Option<u64>> {
+    let value = match headers.get("x-update-range") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let err = || anyhow!("Invalid X-Update-Range Header");
+    let value = value.to_str().map_err(|_| err())?;
+    if value == "append" {
+        return Ok(Some(size));
+    }
+    let (start, _) = parse_range(value, size).ok_or_else(err)?;
+    Ok(Some(start))
 }

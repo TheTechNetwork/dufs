@@ -13,7 +13,7 @@ Dufs is a distinctive utility file server that supports static serving, uploadin
 - Download folder as zip file
 - Upload files and folders (Drag & Drop)
 - Create/Edit/Search files
-- Partial responses (Parallel/Resume download)
+- Resumable/partial uploads/downloads
 - Access control
 - Support https
 - Support webdav
@@ -151,52 +151,66 @@ dufs --tls-cert my.crt --tls-key my.key
 
 Upload a file
 
-```
+```sh
 curl -T path-to-file http://127.0.0.1:5000/new-path/path-to-file
 ```
 
 Download a file
-```
+```sh
 curl http://127.0.0.1:5000/path-to-file
 ```
 
 Download a folder as zip file
 
-```
+```sh
 curl -o path-to-folder.zip http://127.0.0.1:5000/path-to-folder?zip
 ```
 
 Delete a file/folder
 
-```
+```sh
 curl -X DELETE http://127.0.0.1:5000/path-to-file-or-folder
 ```
 
 Create a directory
 
-```
+```sh
 curl -X MKCOL https://127.0.0.1:5000/path-to-folder
 ```
 
 Move the file/folder to the new path
 
-```
+```sh
 curl -X MOVE https://127.0.0.1:5000/path -H "Destination: https://127.0.0.1:5000/new-path"
 ```
 
 List/search directory contents
 
-```
+```sh
 curl http://127.0.0.1:5000?q=Dockerfile           # search for files, similar to `find -name Dockerfile`
 curl http://127.0.0.1:5000?simple                 # output names only, similar to `ls -1`
 curl http://127.0.0.1:5000?json                   # output paths in json format
 ```
 
-With authorization
+With authorization (Both basic or digest auth works)
 
+```sh
+curl http://127.0.0.1:5000/file --user user:pass                 # basic auth
+curl http://127.0.0.1:5000/file --user user:pass --digest        # digest auth
 ```
-curl http://192.168.8.10:5000/file --user user:pass                 # basic auth
-curl http://192.168.8.10:5000/file --user user:pass --digest        # digest auth
+
+Resumable downloads
+
+```sh
+curl -C- -o file http://127.0.0.1:5000/file
+```
+
+Resumable uploads
+
+```sh
+upload_offset=$(curl -I -s http://127.0.0.1:5000/file | tr -d '\r' | sed -n 's/content-length: //p')
+dd skip=$upload_offset if=file status=none ibs=1 | \
+  curl -X PATCH -H "X-Update-Range: append" --data-binary @- http://127.0.0.1:5000/file
 ```
 
 <details>
@@ -208,17 +222,17 @@ Dufs supports account based access control. You can control who can do what on w
 
 ```
 dufs -a admin:admin@/:rw -a guest:guest@/
-dufs -a user:pass@/:rw,/dir1,/dir2:- -a @/
+dufs -a user:pass@/:rw,/dir1 -a @/
 ```
 
 1. Use `@` to separate the account and paths. No account means anonymous user.
 2. Use `:` to separate the username and password of the account.
 3. Use `,` to separate paths.
-4. Use path suffix `:rw`, `:ro`, `:-` to set permissions: `read-write`, `read-only`, `forbidden`. `:ro` can be omitted.
+4. Use path suffix `:rw`/`:ro` set permissions: `read-write`/`read-only`. `:ro` can be omitted.
 
 - `-a admin:admin@/:rw`: `admin` has complete permissions for all paths.
 - `-a guest:guest@/`: `guest` has read-only permissions for all paths.
-- `-a user:pass@/:rw,/dir1,/dir2:-`: `user` has read-write permissions for `/*`, has read-only permissions for `/dir1/*`, but is fordden for `/dir2/*`.
+- `-a user:pass@/:rw,/dir1`: `user` has read-write permissions for `/*`, has read-only permissions for `/dir1/*`.
 - `-a @/`: All paths is publicly accessible, everyone can view/download it.
 
 > There are no restrictions on using ':' and '@' characters in a password. For example, `user:pa:ss@1@/:rw` is valid, the password is `pa:ss@1`.
@@ -388,7 +402,7 @@ Your assets folder must contains a `index.html` file.
 
 ## License
 
-Copyright (c) 2022 dufs-developers.
+Copyright (c) 2022-2024 dufs-developers.
 
 dufs is made available under the terms of either the MIT License or the Apache License 2.0, at your option.
 
