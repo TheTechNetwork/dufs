@@ -15,20 +15,21 @@ use chrono::{LocalResult, TimeZone, Utc};
 use futures_util::{pin_mut, TryStreamExt};
 use headers::{
     AcceptRanges, AccessControlAllowCredentials, AccessControlAllowOrigin, CacheControl,
-    ContentLength, ContentType, ETag, HeaderMap, HeaderMapExt, IfModifiedSince, IfNoneMatch,
-    IfRange, LastModified, Range,
+    ContentLength, ContentType, ETag, HeaderMap, HeaderMapExt, IfMatch, IfModifiedSince,
+    IfNoneMatch, IfRange, IfUnmodifiedSince, LastModified, Range,
 };
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::{
     body::Incoming,
     header::{
-        HeaderValue, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+        HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
         CONTENT_TYPE, RANGE,
     },
     Method, StatusCode, Uri,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -106,12 +107,18 @@ impl Server {
         let uri = req.uri().clone();
         let assets_prefix = &self.assets_prefix;
         let enable_cors = self.args.enable_cors;
+        let is_microsoft_webdav = req
+            .headers()
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.starts_with("Microsoft-WebDAV-MiniRedir/"))
+            .unwrap_or_default();
         let mut http_log_data = self.args.http_logger.data(&req);
         if let Some(addr) = addr {
             http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
         }
 
-        let mut res = match self.clone().handle(req).await {
+        let mut res = match self.clone().handle(req, is_microsoft_webdav).await {
             Ok(res) => {
                 http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
                 if !uri.path().starts_with(assets_prefix) {
@@ -131,13 +138,22 @@ impl Server {
             }
         };
 
+        if is_microsoft_webdav {
+            // microsoft webdav requires this.
+            res.headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("close"));
+        }
         if enable_cors {
             add_cors(&mut res);
         }
         Ok(res)
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request) -> Result<Response> {
+    pub async fn handle(
+        self: Arc<Self>,
+        req: Request,
+        is_microsoft_webdav: bool,
+    ) -> Result<Response> {
         let mut res = Response::default();
 
         let req_path = req.uri().path();
@@ -161,7 +177,10 @@ impl Server {
         }
 
         let authorization = headers.get(AUTHORIZATION);
-        let guard = self.args.auth.guard(&relative_path, &method, authorization);
+        let guard =
+            self.args
+                .auth
+                .guard(&relative_path, &method, authorization, is_microsoft_webdav);
 
         let (user, access_paths) = match guard {
             (None, None) => {
@@ -307,6 +326,8 @@ impl Server {
                     } else if query_params.contains_key("view") {
                         self.handle_edit_file(path, DataKind::View, head_only, user, &mut res)
                             .await?;
+                    } else if query_params.contains_key("hash") {
+                        self.handle_hash_file(path, head_only, &mut res).await?;
                     } else {
                         self.handle_send_file(path, headers, head_only, &mut res)
                             .await?;
@@ -775,18 +796,29 @@ impl Server {
         let size = meta.len();
         let mut use_range = true;
         if let Some((etag, last_modified)) = extract_cache_headers(&meta) {
-            let cached = {
-                if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
-                    !if_none_match.precondition_passes(&etag)
-                } else if let Some(if_modified_since) = headers.typed_get::<IfModifiedSince>() {
-                    !if_modified_since.is_modified(last_modified.into())
-                } else {
-                    false
+            if let Some(if_unmodified_since) = headers.typed_get::<IfUnmodifiedSince>() {
+                if !if_unmodified_since.precondition_passes(last_modified.into()) {
+                    *res.status_mut() = StatusCode::PRECONDITION_FAILED;
+                    return Ok(());
                 }
-            };
-            if cached {
-                *res.status_mut() = StatusCode::NOT_MODIFIED;
-                return Ok(());
+            }
+            if let Some(if_match) = headers.typed_get::<IfMatch>() {
+                if !if_match.precondition_passes(&etag) {
+                    *res.status_mut() = StatusCode::PRECONDITION_FAILED;
+                    return Ok(());
+                }
+            }
+            if let Some(if_modified_since) = headers.typed_get::<IfModifiedSince>() {
+                if !if_modified_since.is_modified(last_modified.into()) {
+                    *res.status_mut() = StatusCode::NOT_MODIFIED;
+                    return Ok(());
+                }
+            }
+            if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
+                if !if_none_match.precondition_passes(&etag) {
+                    *res.status_mut() = StatusCode::NOT_MODIFIED;
+                    return Ok(());
+                }
             }
 
             res.headers_mut().typed_insert(last_modified);
@@ -915,6 +947,24 @@ impl Server {
         Ok(())
     }
 
+    async fn handle_hash_file(
+        &self,
+        path: &Path,
+        head_only: bool,
+        res: &mut Response,
+    ) -> Result<()> {
+        let output = sha256_file(path).await?;
+        res.headers_mut()
+            .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
+        res.headers_mut()
+            .typed_insert(ContentLength(output.as_bytes().len() as u64));
+        if head_only {
+            return Ok(());
+        }
+        *res.body_mut() = body_full(output);
+        Ok(())
+    }
+
     async fn handle_propfind_dir(
         &self,
         path: &Path,
@@ -924,9 +974,10 @@ impl Server {
     ) -> Result<()> {
         let depth: u32 = match headers.get("depth") {
             Some(v) => match v.to_str().ok().and_then(|v| v.parse().ok()) {
-                Some(v) => v,
-                None => {
-                    status_bad_request(res, "");
+                Some(0) => 0,
+                Some(1) => 1,
+                _ => {
+                    status_bad_request(res, "Invalid depth: only 0 and 1 are allowed.");
                     return Ok(());
                 }
             },
@@ -936,7 +987,7 @@ impl Server {
             Some(v) => vec![v],
             None => vec![],
         };
-        if depth != 0 {
+        if depth == 1 {
             match self
                 .list_dir(path, &self.args.serve_path, access_paths)
                 .await
@@ -1183,7 +1234,7 @@ impl Server {
         let guard = self
             .args
             .auth
-            .guard(&dest_path, req.method(), authorization);
+            .guard(&dest_path, req.method(), authorization, false);
 
         match guard {
             (_, Some(_)) => {}
@@ -1362,7 +1413,7 @@ impl PathItem {
 
     pub fn to_dav_xml(&self, prefix: &str) -> String {
         let mtime = match Utc.timestamp_millis_opt(self.mtime as i64) {
-            LocalResult::Single(v) => v.to_rfc2822(),
+            LocalResult::Single(v) => format!("{}", v.format("%a, %d %b %Y %H:%M:%S GMT")),
             _ => String::new(),
         };
         let mut href = encode_uri(&format!("{}{}", prefix, &self.name));
@@ -1535,7 +1586,6 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let mut writer = ZipFileWriter::with_tokio(writer);
     let hidden = Arc::new(hidden.to_vec());
-    let hidden = hidden.clone();
     let dir_clone = dir.to_path_buf();
     let zip_paths = tokio::task::spawn_blocking(move || {
         let mut paths: Vec<PathBuf> = vec![];
@@ -1716,4 +1766,21 @@ fn parse_upload_offset(headers: &HeaderMap<HeaderValue>, size: u64) -> Result<Op
     }
     let (start, _) = parse_range(value, size).ok_or_else(err)?;
     Ok(Some(start))
+}
+
+async fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let bytes_read = file.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    let result = hasher.finalize();
+    Ok(format!("{:x}", result))
 }

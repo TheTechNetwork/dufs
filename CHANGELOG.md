@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.41.0] - 2024-05-22
+
+### Bug Fixes
+
+- Timestamp format of getlastmodified in dav xml ([#366](https://github.com/sigoden/dufs/issues/366))
+- Strange issue that occurs only on Microsoft WebDAV ([#382](https://github.com/sigoden/dufs/issues/382))
+- Head div overlap main contents when wrap ([#386](https://github.com/sigoden/dufs/issues/386))
+
+### Features
+
+- Tls handshake timeout ([#368](https://github.com/sigoden/dufs/issues/368))
+- Add api to get the hash of a file ([#375](https://github.com/sigoden/dufs/issues/375))
+- Add log-file option ([#383](https://github.com/sigoden/dufs/issues/383))
+
+### Refactor
+
+- Digest_auth related tests ([#372](https://github.com/sigoden/dufs/issues/372))
+- Add fixed-width numerals to date and size on file list page ([#378](https://github.com/sigoden/dufs/issues/378))
+
+## [0.40.0] - 2024-02-13
+
+### Bug Fixes
+
+- Guard req and destination path ([#359](https://github.com/sigoden/dufs/issues/359))
+
+### Features
+
+- Revert supporting for forbidden permission ([#352](https://github.com/sigoden/dufs/issues/352))
+
+### Refactor
+
+- Do not try to bind ipv6 if no ipv6 ([#348](https://github.com/sigoden/dufs/issues/348))
+- Improve invalid auth ([#356](https://github.com/sigoden/dufs/issues/356))
+- Improve resolve_path and handle_assets, abandon guard_path ([#360](https://github.com/sigoden/dufs/issues/360))
+
 ## [0.39.0] - 2024-01-11
 
 ### Bug Fixes
@@ -69,7 +104,7 @@ All notable changes to this project will be documented in this file.
 
 - Remove one clone on `assets_prefix` ([#270](https://github.com/sigoden/dufs/issues/270))
 - Optimize tests
-- Improve code quanity ([#282](https://github.com/sigoden/dufs/issues/282))
+- Improve code quality ([#282](https://github.com/sigoden/dufs/issues/282))
 
 ## [0.36.0] - 2023-08-24
 

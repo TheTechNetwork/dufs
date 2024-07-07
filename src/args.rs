@@ -198,6 +198,15 @@ pub fn build_cli() -> Command {
                 .help("Customize http log format"),
         )
         .arg(
+            Arg::new("log-file")
+                .env("DUFS_LOG_FILE")
+                .hide_env(true)
+                .long("log-file")
+                .value_name("file")
+                .value_parser(value_parser!(PathBuf))
+                .help("Specify the file to save logs to, other than stdout/stderr"),
+        )
+        .arg(
             Arg::new("compress")
                 .env("DUFS_COMPRESS")
                 .hide_env(true)
@@ -280,6 +289,7 @@ pub struct Args {
     #[serde(deserialize_with = "deserialize_log_http")]
     #[serde(rename = "log-format")]
     pub http_logger: HttpLogger,
+    pub log_file: Option<PathBuf>,
     pub compress: Compress,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
@@ -301,7 +311,7 @@ impl Args {
         }
 
         if let Some(path) = matches.get_one::<PathBuf>("serve-path") {
-            args.serve_path = path.clone()
+            args.serve_path.clone_from(path)
         }
 
         args.serve_path = Self::sanitize_path(args.serve_path)?;
@@ -317,7 +327,7 @@ impl Args {
 
         args.path_is_file = args.serve_path.metadata()?.is_file();
         if let Some(path_prefix) = matches.get_one::<String>("path-prefix") {
-            args.path_prefix = path_prefix.clone();
+            args.path_prefix.clone_from(path_prefix)
         }
         args.path_prefix = args.path_prefix.trim_matches('/').to_string();
 
@@ -390,6 +400,10 @@ impl Args {
 
         if let Some(log_format) = matches.get_one::<String>("log-format") {
             args.http_logger = log_format.parse()?;
+        }
+
+        if let Some(log_file) = matches.get_one::<PathBuf>("log-file") {
+            args.log_file = Some(log_file.clone());
         }
 
         if let Some(compress) = matches.get_one::<Compress>("compress") {
