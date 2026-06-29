@@ -3,6 +3,7 @@ mod auth;
 mod http_logger;
 mod http_utils;
 mod logger;
+mod noscript;
 mod server;
 mod utils;
 
@@ -57,7 +58,7 @@ async fn main() -> Result<()> {
         ret = join_all(handles) => {
             for r in ret {
                 if let Err(e) = r {
-                    error!("{}", e);
+                    error!("{e}");
                 }
             }
             Ok(())
@@ -78,7 +79,7 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
     for bind_addr in addrs.iter() {
         let server_handle = server_handle.clone();
         match bind_addr {
-            BindAddr::Address(ip) => {
+            BindAddr::IpAddr(ip) => {
                 let listener = create_listener(SocketAddr::new(*ip, port))
                     .with_context(|| format!("Failed to bind `{ip}:{port}`"))?;
 
@@ -140,26 +141,32 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
                     }
                 };
             }
-            BindAddr::Path(path) => {
-                if path.exists() {
-                    std::fs::remove_file(path)?;
-                }
-                #[cfg(unix)]
+            #[cfg(unix)]
+            BindAddr::SocketPath(path) => {
+                let socket_path = if path.starts_with("@")
+                    && cfg!(any(target_os = "linux", target_os = "android"))
                 {
-                    let listener = tokio::net::UnixListener::bind(path)
-                        .with_context(|| format!("Failed to bind `{}`", path.display()))?;
-                    let handle = tokio::spawn(async move {
-                        loop {
-                            let Ok((stream, _addr)) = listener.accept().await else {
-                                continue;
-                            };
-                            let stream = TokioIo::new(stream);
-                            tokio::spawn(handle_stream(server_handle.clone(), stream, None));
-                        }
-                    });
+                    let mut path_buf = path.as_bytes().to_vec();
+                    path_buf[0] = b'\0';
+                    unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&path_buf) }
+                        .to_os_string()
+                } else {
+                    let _ = std::fs::remove_file(path);
+                    path.into()
+                };
+                let listener = tokio::net::UnixListener::bind(socket_path)
+                    .with_context(|| format!("Failed to bind `{path}`"))?;
+                let handle = tokio::spawn(async move {
+                    loop {
+                        let Ok((stream, _addr)) = listener.accept().await else {
+                            continue;
+                        };
+                        let stream = TokioIo::new(stream);
+                        tokio::spawn(handle_stream(server_handle.clone(), stream, None));
+                    }
+                });
 
-                    handles.push(handle);
-                }
+                handles.push(handle);
             }
         }
     }
@@ -204,31 +211,35 @@ fn create_listener(addr: SocketAddr) -> Result<TcpListener> {
 fn check_addrs(args: &Args) -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
     let mut new_addrs = vec![];
     let mut print_addrs = vec![];
-    let (ipv4_addrs, ipv6_addrs) = interface_addrs()?;
+    let has_unspecified = args
+        .addrs
+        .iter()
+        .any(|a| matches!(a, BindAddr::IpAddr(ip) if ip.is_unspecified()));
+    let (ipv4_addrs, ipv6_addrs) = if has_unspecified {
+        interface_addrs()?
+    } else {
+        (vec![], vec![])
+    };
     for bind_addr in args.addrs.iter() {
+        new_addrs.push(bind_addr.clone());
         match bind_addr {
-            BindAddr::Address(ip) => match &ip {
+            BindAddr::IpAddr(ip) => match &ip {
                 IpAddr::V4(_) => {
-                    if !ipv4_addrs.is_empty() {
-                        new_addrs.push(bind_addr.clone());
-                        if ip.is_unspecified() {
-                            print_addrs.extend(ipv4_addrs.clone());
-                        } else {
-                            print_addrs.push(bind_addr.clone());
-                        }
+                    if ip.is_unspecified() {
+                        print_addrs.extend(ipv4_addrs.clone());
+                    } else {
+                        print_addrs.push(bind_addr.clone());
                     }
                 }
                 IpAddr::V6(_) => {
-                    if !ipv6_addrs.is_empty() {
-                        new_addrs.push(bind_addr.clone());
-                        if ip.is_unspecified() {
-                            print_addrs.extend(ipv6_addrs.clone());
-                        } else {
-                            print_addrs.push(bind_addr.clone())
-                        }
+                    if ip.is_unspecified() {
+                        print_addrs.extend(ipv6_addrs.clone());
+                    } else {
+                        print_addrs.push(bind_addr.clone());
                     }
                 }
             },
+            #[cfg(unix)]
             _ => {
                 new_addrs.push(bind_addr.clone());
                 print_addrs.push(bind_addr.clone())
@@ -246,10 +257,10 @@ fn interface_addrs() -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
     for iface in ifaces.into_iter() {
         let ip = iface.ip();
         if ip.is_ipv4() {
-            ipv4_addrs.push(BindAddr::Address(ip))
+            ipv4_addrs.push(BindAddr::IpAddr(ip))
         }
         if ip.is_ipv6() {
-            ipv6_addrs.push(BindAddr::Address(ip))
+            ipv6_addrs.push(BindAddr::IpAddr(ip))
         }
     }
     Ok((ipv4_addrs, ipv6_addrs))
@@ -260,7 +271,7 @@ fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
     let urls = print_addrs
         .iter()
         .map(|bind_addr| match bind_addr {
-            BindAddr::Address(addr) => {
+            BindAddr::IpAddr(addr) => {
                 let addr = match addr {
                     IpAddr::V4(_) => format!("{}:{}", addr, args.port),
                     IpAddr::V6(_) => format!("[{}]:{}", addr, args.port),
@@ -272,7 +283,8 @@ fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
                 };
                 format!("{}://{}{}", protocol, addr, args.uri_prefix)
             }
-            BindAddr::Path(path) => path.display().to_string(),
+            #[cfg(unix)]
+            BindAddr::SocketPath(path) => path.to_string(),
         })
         .collect::<Vec<_>>();
 

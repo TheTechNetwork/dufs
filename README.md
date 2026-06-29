@@ -66,7 +66,8 @@ Options:
       --allow-delete         Allow delete files/folders
       --allow-search         Allow search files/folders
       --allow-symlink        Allow symlink to files/folders outside root directory
-      --allow-archive        Allow zip archive generation
+      --allow-archive        Allow download folders as archive file
+      --allow-hash           Allow ?hash query to get file sha256 hash
       --enable-cors          Enable CORS, sets `Access-Control-Allow-Origin: *`
       --render-index         Serve index.html when requesting a directory, returns 404 if not found index.html
       --render-try-index     Serve index.html when requesting a directory, returns directory listing if not found index.html
@@ -216,8 +217,14 @@ dd skip=$upload_offset if=file status=none ibs=1 | \
   curl -X PATCH -H "X-Update-Range: append" --data-binary @- http://127.0.0.1:5000/file
 ```
 
+Health checks
+
+```sh
+curl http://127.0.0.1:5000/__dufs__/health
+```
+
 <details>
-<summary><h2>Advanced topics</h2></summary>
+<summary><h2>Advanced Topics</h2></summary>
 
 ### Access Control
 
@@ -238,24 +245,25 @@ dufs -a user:pass@/:rw,/dir1 -a @/
 - `-a user:pass@/:rw,/dir1`: `user` has read-write permissions for `/*`, has read-only permissions for `/dir1/*`.
 - `-a @/`: All paths is publicly accessible, everyone can view/download it.
 
-> There are no restrictions on using ':' and '@' characters in a password. For example, `user:pa:ss@1@/:rw` is valid, the password is `pa:ss@1`.
+**Auth permissions are restricted by dufs global permissions.** If dufs does not enable upload permissions via `--allow-upload`, then the account will not have upload permissions even if it is granted `read-write`(`:rw`) permissions.
 
 #### Hashed Password
 
 DUFS supports the use of sha-512 hashed password.
 
-Create hashed password
+Create hashed password:
 
-```
-$ mkpasswd  -m sha-512 -s
-Password: 123456 
+```sh
+$ openssl passwd -6 123456 # or `mkpasswd -m sha-512 123456`
 $6$tWMB51u6Kb2ui3wd$5gVHP92V9kZcMwQeKTjyTRgySsYJu471Jb1I6iHQ8iZ6s07GgCIO69KcPBRuwPE5tDq05xMAzye0NxVKuJdYs/
 ```
 
-Use hashed password
-```
+Use hashed password:
+
+```sh
 dufs -a 'admin:$6$tWMB51u6Kb2ui3wd$5gVHP92V9kZcMwQeKTjyTRgySsYJu471Jb1I6iHQ8iZ6s07GgCIO69KcPBRuwPE5tDq05xMAzye0NxVKuJdYs/@/:rw'
 ```
+> The hashed password contains `$6`, which can expand to a variable in some shells, so you have to use **single quotes** to wrap it.
 
 Two important things for hashed passwords:
 
@@ -295,9 +303,16 @@ The log format can use following variables.
 | $http_       | arbitrary request header field. examples: $http_user_agent, $http_referer |
 
 
-The default log format is `'$remote_addr "$request" $status'`.
+The default log format is `'$time_iso8601 $log_level - $remote_addr "$request" $status`.
 ```
 2022-08-06T06:59:31+08:00 INFO - 127.0.0.1 "GET /" 200
+```
+
+A json log format is also supported.
+```
+dufs --log-format '{"time":"$time_local","addr":"$remote_addr","uri":"$request_uri", "method":"$request_method","status":$status}'
+
+{"time":"2022-08-06T06:59:31+08:00","addr":"127.0.0.1","uri":"/", "method":"GET","status":200}
 ```
 
 Disable http log
@@ -339,6 +354,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --allow-search          DUFS_ALLOW_SEARCH=true
     --allow-symlink         DUFS_ALLOW_SYMLINK=true
     --allow-archive         DUFS_ALLOW_ARCHIVE=true
+    --allow-hash            DUFS_ALLOW_HASH=true
     --enable-cors           DUFS_ENABLE_CORS=true
     --render-index          DUFS_RENDER_INDEX=true
     --render-try-index      DUFS_RENDER_TRY_INDEX=true
@@ -376,6 +392,7 @@ allow-delete: true
 allow-search: true
 allow-symlink: true
 allow-archive: true
+allow-hash: true
 enable-cors: true
 render-index: true
 render-try-index: true
@@ -396,12 +413,22 @@ Dufs allows users to customize the UI with your own assets.
 dufs --assets my-assets-dir/
 ```
 
+> If you only need to make slight adjustments to the current UI, you copy dufs's [assets](https://github.com/sigoden/dufs/tree/main/assets) directory and modify it accordingly. The current UI doesn't use any frameworks, just plain HTML/JS/CSS. As long as you have some basic knowledge of web development, it shouldn't be difficult to modify.
+
 Your assets folder must contains a `index.html` file.
 
 `index.html` can use the following placeholder variables to retrieve internal data.
 
 - `__INDEX_DATA__`: directory listing data
 - `__ASSETS_PREFIX__`: assets url prefix
+
+> A customized 404.html page is also supported.
+
+Here are some Third-party customize UI project:
+
+- https://github.com/TransparentLC/dufs-material-assets
+- https://github.com/cercky/dufs_web
+- https://github.com/52funny/dufs-tabler-web
 
 </details>
 

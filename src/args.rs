@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use async_zip::Compression;
+use async_deflate_zip::Compression;
 use clap::builder::{PossibleValue, PossibleValuesParser};
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command, ValueEnum};
 use clap_complete::{generate, Generator, Shell};
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::auth::AccessControl;
 use crate::http_logger::HttpLogger;
-use crate::utils::encode_uri;
+use crate::utils::{encode_uri, is_ipv6_available};
 
 pub fn build_cli() -> Command {
     let app = Command::new(env!("CARGO_CRATE_NAME"))
@@ -146,7 +146,15 @@ pub fn build_cli() -> Command {
 				.hide_env(true)
                 .long("allow-archive")
                 .action(ArgAction::SetTrue)
-                .help("Allow zip archive generation"),
+                .help("Allow download folders as archive file"),
+        )
+        .arg(
+            Arg::new("allow-hash")
+                .env("DUFS_ALLOW_HASH")
+                .hide_env(true)
+                .long("allow-hash")
+                .action(ArgAction::SetTrue)
+                .help("Allow ?hash query to get file sha256 hash"),
         )
         .arg(
             Arg::new("enable-cors")
@@ -281,11 +289,13 @@ pub struct Args {
     pub allow_search: bool,
     pub allow_symlink: bool,
     pub allow_archive: bool,
+    pub allow_hash: bool,
     pub render_index: bool,
     pub render_spa: bool,
     pub render_try_index: bool,
     pub enable_cors: bool,
     pub assets: Option<PathBuf>,
+    pub error_page: Option<PathBuf>,
     #[serde(deserialize_with = "deserialize_log_http")]
     #[serde(rename = "log-format")]
     pub http_logger: HttpLogger,
@@ -375,6 +385,9 @@ impl Args {
         if !args.allow_symlink {
             args.allow_symlink = allow_all || matches.get_flag("allow-symlink");
         }
+        if !args.allow_hash {
+            args.allow_hash = allow_all || matches.get_flag("allow-hash");
+        }
         if !args.allow_archive {
             args.allow_archive = allow_all || matches.get_flag("allow-archive");
         }
@@ -396,6 +409,13 @@ impl Args {
 
         if let Some(assets_path) = &args.assets {
             args.assets = Some(Args::sanitize_assets_path(assets_path)?);
+        }
+
+        if let Some(assets_path) = &args.assets {
+            let p = assets_path.join("404.html");
+            if p.exists() {
+                args.error_page = Some(p);
+            }
         }
 
         if let Some(log_format) = matches.get_one::<String>("log-format") {
@@ -461,28 +481,30 @@ impl Args {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BindAddr {
-    Address(IpAddr),
-    Path(PathBuf),
+    IpAddr(IpAddr),
+    #[cfg(unix)]
+    SocketPath(String),
 }
 
 impl BindAddr {
     fn parse_addrs(addrs: &[&str]) -> Result<Vec<Self>> {
         let mut bind_addrs = vec![];
+        #[cfg(not(unix))]
         let mut invalid_addrs = vec![];
         for addr in addrs {
             match addr.parse::<IpAddr>() {
                 Ok(v) => {
-                    bind_addrs.push(BindAddr::Address(v));
+                    bind_addrs.push(BindAddr::IpAddr(v));
                 }
                 Err(_) => {
-                    if cfg!(unix) {
-                        bind_addrs.push(BindAddr::Path(PathBuf::from(addr)));
-                    } else {
-                        invalid_addrs.push(*addr);
-                    }
+                    #[cfg(unix)]
+                    bind_addrs.push(BindAddr::SocketPath(addr.to_string()));
+                    #[cfg(not(unix))]
+                    invalid_addrs.push(*addr);
                 }
             }
         }
+        #[cfg(not(unix))]
         if !invalid_addrs.is_empty() {
             bail!("Invalid bind address `{}`", invalid_addrs.join(","));
         }
@@ -490,19 +512,14 @@ impl BindAddr {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Compress {
     None,
+    #[default]
     Low,
     Medium,
     High,
-}
-
-impl Default for Compress {
-    fn default() -> Self {
-        Self::Low
-    }
 }
 
 impl ValueEnum for Compress {
@@ -523,10 +540,10 @@ impl ValueEnum for Compress {
 impl Compress {
     pub fn to_compression(self) -> Compression {
         match self {
-            Compress::None => Compression::Stored,
-            Compress::Low => Compression::Deflate,
-            Compress::Medium => Compression::Bz,
-            Compress::High => Compression::Xz,
+            Compress::None => Compression::none(),
+            Compress::Low => Compression::fast(),
+            Compress::Medium => Compression::default(),
+            Compress::High => Compression::best(),
         }
     }
 }
@@ -616,7 +633,12 @@ fn default_serve_path() -> PathBuf {
 }
 
 fn default_addrs() -> Vec<BindAddr> {
-    BindAddr::parse_addrs(&["0.0.0.0", "::"]).unwrap()
+    let addrs = if is_ipv6_available() {
+        ["0.0.0.0", "::"].as_slice()
+    } else {
+        ["0.0.0.0"].as_slice()
+    };
+    BindAddr::parse_addrs(addrs).unwrap()
 }
 
 fn default_port() -> u16 {
@@ -710,7 +732,7 @@ hidden: tmp,*.log,*.lock
         assert_eq!(args.serve_path, Args::sanitize_path(&tmpdir).unwrap());
         assert_eq!(
             args.addrs,
-            vec![BindAddr::Address("0.0.0.0".parse().unwrap())]
+            vec![BindAddr::IpAddr("0.0.0.0".parse().unwrap())]
         );
         assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
         assert_eq!(args.port, 3000);
@@ -740,8 +762,8 @@ hidden:
         assert_eq!(
             args.addrs,
             vec![
-                BindAddr::Address("127.0.0.1".parse().unwrap()),
-                BindAddr::Address("192.168.8.10".parse().unwrap())
+                BindAddr::IpAddr("127.0.0.1".parse().unwrap()),
+                BindAddr::IpAddr("192.168.8.10".parse().unwrap())
             ]
         );
         assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
